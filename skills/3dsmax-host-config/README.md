@@ -20,7 +20,23 @@ AWS Deadline Cloud Service Managed Fleet workers.
    - `"Create a host configuration script for 3ds Max 2026"`
    - `"Create a host configuration script for 3ds Max 2026 and V-Ray 8"`
    - `"Add a host config script for 3ds Max 2027 with Forest Pack 10 and RailClone 7"`
-3. Kiro will generate the `.ps1` script and a `README.md` for your version combination
-4. Fill in the `TODO` variables at the top of the script. Each installer has its own full S3 URI variable (e.g. `$3DS_MAX_INSTALLER_ZIP_S3_URI="s3://your-bucket/path/to/installer.zip"`)
+3. Kiro generates the `.ps1` script for your version combination and adds a row describing it to the
+   shared [3ds Max README](../../host_configuration_scripts/3dsmax/README.md)
+4. Fill in the CONFIG block at the top of the script. Every editable value sits in that one block, and each
+   carries its expected format inline. Each installer has its own full S3 URI variable (e.g.
+   `$3DS_MAX_INSTALLER_ZIP_S3_URI="s3://your-bucket/path/to/installer.zip"`)
 5. Upload your installers to your S3 bucket
 6. Configure your Service Managed Fleet to use the generated script
+
+### What the generated script does for you
+
+The script follows the robustness standards shared by the host configuration samples in this repository:
+
+- Validates your CONFIG values and downloads every installer before running any install, so a typo in an
+  S3 URI fails in seconds instead of part way through a long install
+- Captures installer output into CloudWatch, so a silent install that fails reports a reason rather than
+  only an exit code
+- Builds install paths from the 3ds Max version you set once, instead of repeating the year throughout,
+  which is the usual source of breakage when bumping versions
+- Detects a persistent volume automatically when your fleet attaches one, installing once and restoring on
+  later boots. No configuration is needed to enable it
