@@ -1,0 +1,226 @@
+$ErrorActionPreference = "Stop"
+trap { Write-Output "ERROR: $($_.Exception.Message)`n$($_.InvocationInfo.PositionMessage)`n$($_.ScriptStackTrace)"; exit 1 }
+
+# CONFIG ================
+# Required
+$MAX_VERSION = "2027"  # required. format: YYYY. supported: 2024, 2025, 2026, 2027
+# Guide on how to create the 3ds Max installer zip file: https://github.com/aws-deadline/deadline-cloud-samples/blob/mainline/host_configuration_scripts/3dsmax/README.md
+$3DS_MAX_INSTALLER_ZIP_S3_URI = "s3://<bucket>/3ds-max-2027.zip"  # required
+
+# Optional components. Leave blank to skip.
+$CORONA_S3_URI = ""  # Corona 14 or later for 2027. e.g. s3://<bucket>/chaos-corona-14-3dsmax.exe
+
+# 2027 render nodes need ADP consent to start, and it enables Autodesk analytics. See the README.
+$ADP_ANALYTICS_OPT_IN = $false  # $true or $false. 2027 only
+# END CONFIG ================
+
+$MAX_ROOT = "C:\Program Files\Autodesk\3ds Max $MAX_VERSION"
+$MAX_PY = "$MAX_ROOT\Python"
+$CHAOS_COMMON = "C:\Program Files\Common Files\ChaosGroup"
+$DOWNLOADS_PATH = "C:\Temp"
+$SETUP_PATH = "C:\3dsmax_setup"
+# Product registration only. Licensing state is deliberately not persisted, see the README
+$REG_KEYS = @("HKLM\SOFTWARE\Autodesk\3dsMax", "HKLM\SOFTWARE\Chaos Group")
+
+function Invoke-WithErrorCapture($path, $argList){
+    $outFile = New-TemporaryFile
+    $errFile = New-TemporaryFile
+    $p = Start-Process -FilePath $path -ArgumentList $argList -Wait -PassThru -NoNewWindow -RedirectStandardOutput $outFile.FullName -RedirectStandardError $errFile.FullName
+    if ($p.ExitCode -ne 0) {
+        throw "Command failed with exit code $($p.ExitCode): $path $argList`n$(Get-Content $outFile -Raw)$(Get-Content $errFile -Raw)"
+    }
+}
+function Save-URI($uri){
+    $file = Split-Path -Leaf $uri
+    $path = "$DOWNLOADS_PATH\$file"
+    $outFile = New-TemporaryFile
+    $errFile = New-TemporaryFile
+    $p = Start-Process -FilePath "aws" -ArgumentList "s3 cp --no-progress `"$uri`" `"$path`"" -PassThru -NoNewWindow -RedirectStandardOutput $outFile.FullName -RedirectStandardError $errFile.FullName
+    $p.Handle | Out-Null
+    return [pscustomobject]@{ FilePath = $path; File = $file; ErrFile = $errFile.FullName; OutFile = $outFile.FullName; Uri = $uri; Process = $p }
+}
+function Wait-Download($download){
+    $download.Process.WaitForExit()
+    if ($download.Process.ExitCode -ne 0 -or -not (Test-Path $download.FilePath)) { throw "Download failed ($($download.Process.ExitCode)): $($download.Uri)`n$(Get-Content $download.OutFile -Raw)$(Get-Content $download.ErrFile -Raw)" }
+}
+function Set-MachineEnvVar($name, $value){ [Environment]::SetEnvironmentVariable($name,$value,"Machine") }
+function Write-Duration($start, $name){ Write-Host "$($name): $(((Get-Date) - $start).ToString('hh\:mm\:ss'))" }
+
+# Machine env vars live on the OS disk, so set them on every boot including a restore
+function Set-AllEnvVars {
+    Set-MachineEnvVar "Path" "$MAX_ROOT;$MAX_PY;$MAX_PY\Scripts;$([Environment]::GetEnvironmentVariable('Path','Machine'))"
+    Set-MachineEnvVar "3DSMAX_EXECUTABLE" "$MAX_ROOT\3dsmaxbatch.exe"
+    Set-MachineEnvVar "PYTHONPATH" "$MAX_PY;$MAX_PY\Scripts"
+    # Corona shares V-Ray's licensing structure. This must point at the directory, not at vrlclient.xml
+    if ($CORONA_S3_URI) { Set-MachineEnvVar "VRAY_AUTH_CLIENT_FILE_PATH" $CHAOS_COMMON }
+}
+
+# Licensing is not kept on the persistent volume, so rewrite this client config on every boot
+function Set-CoronaLicenseConfig {
+    if (-not $CORONA_S3_URI) { return }
+    New-Item -ItemType Directory -Path $CHAOS_COMMON -Force | Out-Null
+    @"
+<VRLClient>
+<LicServer>
+<Host>127.0.0.1</Host>
+<Port>30304</Port>
+<Host1>localhost</Host1>
+<Port1>30304</Port1>
+<Host2></Host2>
+<Port2>30304</Port2>
+<User></User>
+<Pass></Pass>
+</LicServer>
+</VRLClient>
+"@ | Set-Content -Path "$CHAOS_COMMON\vrlclient.xml" -Encoding UTF8 -Force
+}
+
+# The Default user profile sits on the ephemeral OS disk, so write consent on every boot
+function Set-ADPConsent {
+    if (-not $ADP_ANALYTICS_OPT_IN -or $MAX_VERSION -ne "2027") { return }
+    $dir = "C:\Users\Default\AppData\Roaming\Autodesk\ADPSDK\UserConsent"
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $ids = "ADSK_PUD_CONTRACTUAL_NECESSITY_DESKTOP", "ADSK_PUD_OPTIMIZATION_IMPROVEMENT_DESKTOP", "ADSK_PUD_GO_TO_MARKET_DESKTOP"
+    @{ preferences = @($ids | ForEach-Object { @{ consentId = $_; optIn = $true } }); userActionRequired = $false; userId = "UnNamed"
+    } | ConvertTo-Json -Depth 5 | Set-Content -Path "$dir\UnNamed.json" -Encoding UTF8
+    Write-Host "Recorded Autodesk ADP opt-in consent in the Default user profile"
+}
+
+function Initialize-Junctions {
+    foreach ($j in $junctions) {
+        New-Item -ItemType Directory -Path $j.Target -Force | Out-Null
+        if (Test-Path $j.Link) {
+            if ((Get-Item $j.Link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            Remove-Item $j.Link -Recurse -Force
+        }
+        $parent = Split-Path $j.Link -Parent
+        if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        New-Item -ItemType Junction -Path $j.Link -Target $j.Target | Out-Null
+        Write-Host "Junction: $($j.Link) -> $($j.Target)"
+    }
+}
+
+# Registry keys and service registrations are on the OS disk, so save them beside the installed files
+function Export-InstallerState {
+    New-Item -ItemType Directory -Path $STATE_BACKUP -Force | Out-Null
+    foreach ($key in $REG_KEYS) { reg.exe export "$key" "$STATE_BACKUP\$(($key -split '\\')[-1]).reg" /y 2>&1 | Out-Null }
+    foreach ($svc in Get-CimInstance Win32_Service | Where-Object { $_.PathName -match "Autodesk|Chaos" }) {
+        @{ Name = $svc.Name; DisplayName = $svc.DisplayName; PathName = $svc.PathName; StartMode = $svc.StartMode
+        } | ConvertTo-Json | Out-File "$STATE_BACKUP\$($svc.Name).json"
+    }
+}
+function Import-InstallerState {
+    if (-not (Test-Path $STATE_BACKUP)) { return }
+    foreach ($file in Get-ChildItem "$STATE_BACKUP\*.reg") { reg.exe import "$($file.FullName)" 2>&1 | Out-Null }
+    foreach ($file in Get-ChildItem "$STATE_BACKUP\*.json") {
+        try {
+            $svc = Get-Content $file.FullName | ConvertFrom-Json
+            if (Get-Service -Name $svc.Name -ErrorAction SilentlyContinue) { continue }
+            $startType = switch ($svc.StartMode) { "Auto" { "auto" } "Disabled" { "disabled" } default { "demand" } }
+            sc.exe create $svc.Name binPath= "$($svc.PathName)" start= $startType DisplayName= "$($svc.DisplayName)" | Out-Null
+            if ($startType -eq "auto") { Start-Service -Name $svc.Name -ErrorAction SilentlyContinue }
+            Write-Host "Registered service: $($svc.Name)"
+        } catch { Write-Host "WARNING: could not restore $($file.Name): $_" }
+    }
+}
+
+$scriptStart = Get-Date
+
+# Validate all CONFIG before doing any work
+if ($MAX_VERSION -notmatch '^\d{4}$') { throw "CONFIG MAX_VERSION must be a four digit year, e.g. 2027" }
+if ($ADP_ANALYTICS_OPT_IN -isnot [bool]) { throw "CONFIG ADP_ANALYTICS_OPT_IN must be `$true or `$false" }
+if (-not $3DS_MAX_INSTALLER_ZIP_S3_URI) { throw "CONFIG 3DS_MAX_INSTALLER_ZIP_S3_URI is required" }
+foreach ($name in "3DS_MAX_INSTALLER_ZIP_S3_URI","CORONA_S3_URI") {
+    $uri = (Get-Variable $name).Value
+    if ($uri -and ($uri -notlike "s3://*" -or $uri -match '[<>]')) { throw "CONFIG $name is not a usable S3 URI: $uri" }
+}
+if ($MAX_VERSION -eq "2027" -and -not $ADP_ANALYTICS_OPT_IN) {
+    Write-Host "WARNING: ADP_ANALYTICS_OPT_IN is false - 2027 render nodes exit -12 at startup. See the README."
+}
+
+$MOUNT_PATH = [Environment]::GetEnvironmentVariable("DEADLINE_PERSISTENT_MOUNT", "Machine")
+$junctions = @()
+if (-not $MOUNT_PATH) {
+    Write-Host "No persistent volume - normal install"
+    $PERSISTENCE_ENABLED = $false
+} else {
+    Write-Host "Persistent volume detected at: $MOUNT_PATH"
+    $PERSISTENCE_ENABLED = $true
+    $SW_PATH = "$MOUNT_PATH\Software"
+    $DATA_PATH = "$MOUNT_PATH\SoftwareData"
+    $STATE_BACKUP = "$MOUNT_PATH\SoftwareState"
+    $INSTALL_MARKER = "$SW_PATH\.install-complete"
+    $junctions = @(
+        @{ Link = "C:\Program Files\Autodesk"; Target = "$SW_PATH\Autodesk" }
+        @{ Link = "C:\Program Files (x86)\Common Files\Autodesk Shared"; Target = "$SW_PATH\AutodeskShared" }
+        @{ Link = "C:\ProgramData\Autodesk\ApplicationPlugins"; Target = "$DATA_PATH\ApplicationPlugins" }
+    )
+    if ($CORONA_S3_URI) { $junctions += @{ Link = "C:\Program Files\Chaos"; Target = "$SW_PATH\Chaos" } }
+}
+
+if ($PERSISTENCE_ENABLED -and (Test-Path $INSTALL_MARKER)) {
+    Write-Host "=== Restoring from persistent volume ==="
+    $t = Get-Date
+    Initialize-Junctions
+    if (Test-Path "$MAX_ROOT\3dsmaxbatch.exe") {
+        # The registry keys, services, env vars and license config are on the OS disk, so put them back
+        Import-InstallerState
+        Set-AllEnvVars
+        Set-CoronaLicenseConfig
+        Set-ADPConsent
+        Write-Duration $t "Restore"
+        Write-Duration $scriptStart "Total"
+        Exit 0
+    }
+    # Only missing files force a reinstall; anything on the OS disk is restorable
+    Write-Host "WARNING: volume is missing $MAX_ROOT\3dsmaxbatch.exe - reinstalling"
+}
+if ($PERSISTENCE_ENABLED) {
+    Write-Host "=== First boot - installing to persistent volume ==="
+    Initialize-Junctions
+}
+
+New-Item -ItemType Directory -Path $DOWNLOADS_PATH, $SETUP_PATH -Force | Out-Null
+
+Write-Host "Downloading installers from S3 (parallel)..."
+$maxDownload = Save-URI $3DS_MAX_INSTALLER_ZIP_S3_URI
+if ($CORONA_S3_URI) { $coronaDownload = Save-URI $CORONA_S3_URI }
+
+$t = Get-Date
+Write-Host "Installing 3ds Max $MAX_VERSION..."
+Wait-Download $maxDownload
+Expand-Archive -Path $maxDownload.FilePath -DestinationPath $SETUP_PATH -Force
+# Shallowest match wins, so a nested component Setup.exe cannot win over the bootstrapper
+$maxSetup = Get-ChildItem -Path $SETUP_PATH -Filter "Setup.exe" -Recurse | Sort-Object { $_.FullName.Length } | Select-Object -First 1
+if (-not $maxSetup) { throw "3ds Max installer (Setup.exe) not found in $($maxDownload.File)" }
+Invoke-WithErrorCapture $maxSetup.FullName "-q"
+if (-not (Test-Path $MAX_ROOT)) { throw "3ds Max $MAX_VERSION not found at $MAX_ROOT after install" }
+Write-Duration $t "3ds Max"
+
+if ($coronaDownload) {
+    $t = Get-Date
+    Write-Host "Installing Corona for 3ds Max $MAX_VERSION..."
+    Wait-Download $coronaDownload
+    Invoke-WithErrorCapture $coronaDownload.FilePath @("-gui=0", "-auto")
+    Write-Duration $t "Corona"
+}
+
+Write-Host "Configuring environment for 3ds Max $MAX_VERSION..."
+Set-AllEnvVars
+Set-CoronaLicenseConfig
+Set-ADPConsent
+
+Write-Host "Installing Deadline Cloud for 3ds Max..."
+& "$MAX_PY\python.exe" -m ensurepip
+& "$MAX_PY\python.exe" -m pip install deadline-cloud-for-3ds-max
+# A native command's non-zero exit does not trip $ErrorActionPreference, so check it explicitly
+if ($LASTEXITCODE -ne 0) { throw "pip install deadline-cloud-for-3ds-max failed with exit code $LASTEXITCODE" }
+
+if ($PERSISTENCE_ENABLED) {
+    Export-InstallerState
+    Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Out-File $INSTALL_MARKER
+    Write-Host "Install marker written"
+}
+
+Write-Duration $scriptStart "Total"
+Exit 0
